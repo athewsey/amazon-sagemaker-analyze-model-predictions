@@ -127,8 +127,100 @@ if __name__=="__main__":
             indent=4,
         ))
 
-    # You could also consider writing a statistics.json and constraints.json here, per the standard results:
-    # https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-interpreting-results.html
+    print("Writing statistics file...")
+    with open(os.path.join(env.output_path, "statistics.json"), "w") as outfile:
+        outfile.write(json.dumps(
+            {
+                "version": 0,
+                # dataset level stats
+                "dataset": { "item_count": total_record_count },
+                # feature level stats
+                "features": [{
+                    "name": "PredictedClass",
+                    "inferred_type": "Integral",
+                    "numerical_statistics": {
+                        "common": {
+                            # TODO: A bit skewy comparing records to (batched) predictions:
+                            "num_present": int(total_prediction_count),
+                            "num_missing": error_record_count,
+                        },
+                        "mean": float(mean_numeric_label),
+                        "sum": np.sum(
+                            np.array(numeric_class_names)
+                            * np.array([counts[c] for c in numeric_class_names])
+                        ).item(),
+                        "std_dev": np.sqrt(np.average(
+                            (np.array(numeric_class_names) - mean_numeric_label) ** 2,
+                            weights=[counts[c] for c in numeric_class_names],
+                        )).item(),
+                        "min": np.min(numeric_class_names).item(),
+                        "max": np.max(numeric_class_names).item(),
+                        "distribution": {
+                            "kll": {
+                                # Dummy KLL sketch, since we don't actually do it properly:
+                                "buckets": [
+                                    {
+                                        "lower_bound": np.min(numeric_class_names).item(),
+                                        "upper_bound": np.max(numeric_class_names).item(),
+                                        "count": np.sum([counts[c] for c in numeric_class_names]).item(),
+                                    }
+                                ],
+                                "sketch": {
+                                    "parameters": {
+                                        "c": 0.75,
+                                        "k": 2,
+                                    },
+                                    "data": [
+                                        [
+                                            np.min(numeric_class_names).item(),
+                                            np.max(numeric_class_names).item(),
+                                        ],
+                                    ],
+                                },#sketch
+                            },#KLL
+                        },#distribution
+                    },#num_stats
+                }],
+            },
+            indent=4,
+        ))
+        
+    print("Writing constraints file...")
+    # TODO: This constraints file is actually ignored at the moment, just output so we can see viz.
+    with open(os.path.join(env.output_path, "constraints.json"), "w") as outfile:
+        outfile.write(json.dumps(
+            {
+                "version": 0,
+                "features": [{
+                    "name": "PredictedClass",
+                    "inferred_type": "Integral", #| "String" | "Unknown",
+                    "completeness": 1.0, # denotes observed non-null value percentage
+                    "num_constraints": {
+                        "is_non_negative": True,
+                    },
+#                     "string_constraints": {
+#                         "domains": [
+#                             "list of",
+#                             "observed values",
+#                             "for small cardinality"
+#                         ],
+#                     },
+                    "monitoringConfigOverrides" : {},
+                }],
+                "monitoring_config": {
+                    "evaluate_constraints": "Enabled",
+                    "emit_metrics": "Enabled",
+                    "datatype_check_threshold": 1.0,
+                    "domain_content_threshold": 1.0,
+                    "distribution_constraints": {
+                        "perform_comparison": "Enabled",
+                        "comparison_threshold": 0.1,
+                        "comparion_method": "Simple",  #|"Robust"
+                    },
+                },
+            },
+            indent=4,
+        ))
 
     print("Writing overall status output...")
     with open("/opt/ml/output/message", "w") as outfile:
@@ -141,9 +233,11 @@ if __name__=="__main__":
 
     if env.publish_cloudwatch_metrics:
         print("Writing CloudWatch metrics...")
+        # Can't write directly to /cloudwatch as suggested by the docs page because it's a directory
         with open("/opt/ml/output/metrics/cloudwatch/cloudwatch_metrics.jsonl", "a+") as outfile:
             # One metric per line (JSONLines list of dictionaries)
             # Remember these metrics are aggregated in graphs, so we report them as statistics on our dataset
+            # Summary metrics first:
             json.dump(
                 {
                     "MetricName": f"feature_data_PredictedClass",
@@ -154,6 +248,9 @@ if __name__=="__main__":
                             "Name": "MonitoringSchedule",
                             "Value": env.sagemaker_monitoring_schedule_name or "unknown",
                         },
+                        # TODO: Remove, doesn't work
+                        # Need Feature dimension to be able to chart the metrics in Studio
+                        #{ "Name": "Feature", "Value": "Predicted Class" },
                     ],
                     "StatisticValues": {
                         "Maximum": np.max(numeric_class_names).item(),
@@ -179,6 +276,9 @@ if __name__=="__main__":
                             "Name": "MonitoringSchedule",
                             "Value": env.sagemaker_monitoring_schedule_name or "unknown",
                         },
+                        # TODO: Remove, doesn't work
+                        # Need Feature dimension to be able to chart the metrics in Studio
+                        #{ "Name": "Feature", "Value": "Predicted Class" },
                     ],
                     "StatisticValues": {
                         "Maximum": pct_successful,
@@ -203,6 +303,9 @@ if __name__=="__main__":
                             "Name": "MonitoringSchedule",
                             "Value": env.sagemaker_monitoring_schedule_name or "unknown",
                         },
+                        # TODO: Remove, doesn't work
+                        # Need Feature dimension to be able to chart the metrics in Studio
+                        #{ "Name": "Feature", "Value": "Predicted Class" },
                     ],
                     "StatisticValues": {
                         "Maximum": max_class_ratio,
@@ -214,4 +317,26 @@ if __name__=="__main__":
                 outfile
             )
             outfile.write("\n")
+
+            # Metrics per individual class name:
+            for class_name, count in counts.items():
+                json.dump(
+                    {
+                        "MetricName": f"Predicted Class {class_name}",
+                        "Timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), 
+                        "Dimensions": [
+                            { "Name": "Endpoint", "Value": env.sagemaker_endpoint_name or "unknown" },
+                            {
+                                "Name": "MonitoringSchedule",
+                                "Value": env.sagemaker_monitoring_schedule_name or "unknown",
+                            },
+                            # TODO: Remove, doesn't work
+                            # Need Feature dimension to be able to chart the metrics in Studio
+                            #{ "Name": "Feature", "Value": "Predicted Class" },
+                        ],
+                        "Value": count,
+                    },
+                    outfile
+                )
+                outfile.write("\n")
     print("Done")
